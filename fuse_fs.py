@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import logging
 import os
 import stat
 import errno
@@ -9,6 +10,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.exceptions import InvalidTag
 import secrets
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("fuse_fs")
+# Suppress fusepy's internal per-call debug/traceback messages
+logging.getLogger("fuse").setLevel(logging.WARNING)
 
 KEY_SIZE = 32  # AES-256
 NONCE_SIZE = 12
@@ -22,17 +32,21 @@ class FuseFS(Operations):
         self.objects_dir = os.path.join(self.backend, "objects")
         os.makedirs(self.backend, exist_ok=True)
         os.makedirs(self.objects_dir, exist_ok=True)
+        log.info("Initialising filesystem (backend=%s)", self.backend)
         salt = self._load_or_create_salt()
         self.master_key = self._derive_master_key(password, salt)
         self.root_id = self._load_or_create_root_id()
+        log.info("Filesystem ready (root_id=%s)", self.root_id)
 
     # Key management
 
     def _load_or_create_salt(self) -> bytes:
         salt_path = os.path.join(self.backend, ".salt")
         if os.path.exists(salt_path):
+            log.debug("Loading existing salt")
             with open(salt_path, "rb") as f:
                 return f.read()
+        log.info("Creating new salt")
         salt = secrets.token_bytes(SALT_SIZE)
         with open(salt_path, "wb") as f:
             f.write(salt)
@@ -94,13 +108,16 @@ class FuseFS(Operations):
         key_path = self._key_path(node_id)
 
         if os.path.exists(key_path):
+            log.debug("Loading FEK for node %s", node_id)
             with open(key_path, "rb") as f:
                 wrapped = f.read()
             try:
                 return self._decrypt_bytes(self.master_key, wrapped)
             except InvalidTag:
+                log.warning("FEK decryption failed for node %s (bad master key?)", node_id)
                 raise FuseOSError(errno.EACCES)
 
+        log.debug("Generating new FEK for node %s", node_id)
         fek = secrets.token_bytes(KEY_SIZE)
         wrapped = self._encrypt_bytes(self.master_key, fek)
 
@@ -128,10 +145,12 @@ class FuseFS(Operations):
         if os.path.exists(root_path):
             with open(root_path, "r", encoding="utf-8") as f:
                 root_id = f.read().strip()
+            log.debug("Loaded existing root node %s", root_id)
         else:
             root_id = self._generate_node_id()
             with open(root_path, "w", encoding="utf-8") as f:
                 f.write(root_id)
+            log.info("Created new root node %s", root_id)
 
         if not os.path.exists(self._meta_path(root_id)):
             self._create_node(root_id, "dir", 0o755)
@@ -281,6 +300,7 @@ class FuseFS(Operations):
     # Filesystem operations
 
     def getattr(self, path, fh=None):
+        log.debug("getattr %s", path)
         node_id, metadata = self._resolve_path(path)
 
         if metadata["type"] == "file":
@@ -304,6 +324,7 @@ class FuseFS(Operations):
         )
 
     def readdir(self, path, fh):
+        log.debug("readdir %s", path)
         entries = [".", ".."]
 
         node_id, metadata = self._resolve_path(path)
@@ -316,6 +337,7 @@ class FuseFS(Operations):
             yield entry
 
     def create(self, path, mode, fi=None):
+        log.info("create %s (mode=%o)", path, mode)
         parent_id, _, name = self._resolve_parent(path)
         entries = self._load_directory_entries(parent_id)
         if name in entries:
@@ -329,6 +351,7 @@ class FuseFS(Operations):
         return os.open(self._blob_path(node_id), os.O_WRONLY)
 
     def mkdir(self, path, mode):
+        log.info("mkdir %s (mode=%o)", path, mode)
         parent_id, _, name = self._resolve_parent(path)
         entries = self._load_directory_entries(parent_id)
         if name in entries:
@@ -341,6 +364,7 @@ class FuseFS(Operations):
         self._touch_metadata(parent_id, update_modify=True)
 
     def unlink(self, path):
+        log.info("unlink %s", path)
         parent_id, _, name = self._resolve_parent(path)
         entries = self._load_directory_entries(parent_id)
         try:
@@ -357,6 +381,7 @@ class FuseFS(Operations):
         self._touch_metadata(parent_id, update_modify=True)
 
     def rmdir(self, path):
+        log.info("rmdir %s", path)
         parent_id, _, name = self._resolve_parent(path)
         entries = self._load_directory_entries(parent_id)
         try:
@@ -375,6 +400,7 @@ class FuseFS(Operations):
         self._touch_metadata(parent_id, update_modify=True)
 
     def rename(self, old, new):
+        log.info("rename %s -> %s", old, new)
         old_parent_id, _, old_name = self._resolve_parent(old)
         new_parent_id, _, new_name = self._resolve_parent(new)
 
@@ -455,12 +481,14 @@ class FuseFS(Operations):
     # File operations
 
     def open(self, path, flags):
+        log.debug("open %s (flags=%o)", path, flags)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
         return os.open(self._blob_path(node_id), flags)
 
     def read(self, path, size, offset, fh):
+        log.debug("read %s (size=%d, offset=%d)", path, size, offset)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
@@ -471,6 +499,7 @@ class FuseFS(Operations):
         return plaintext[offset : offset + size]
 
     def write(self, path, data, offset, fh):
+        log.debug("write %s (size=%d, offset=%d)", path, len(data), offset)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
@@ -495,6 +524,7 @@ class FuseFS(Operations):
             raise FuseOSError(errno.EIO)
 
     def truncate(self, path, length, fh=None):
+        log.debug("truncate %s (length=%d)", path, length)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
@@ -513,6 +543,7 @@ class FuseFS(Operations):
             raise FuseOSError(errno.EIO)
 
     def utimens(self, path, times=None):
+        log.debug("utimens %s", path)
         node_id, _ = self._resolve_path(path)
         metadata = self._load_metadata(node_id)
 
@@ -529,13 +560,22 @@ class FuseFS(Operations):
         self._save_metadata(node_id, metadata)
         return 0
 
+    def getxattr(self, path, name, position=0):
+        raise FuseOSError(errno.ENOTSUP)
+
+    def listxattr(self, path):
+        return []
+
     def release(self, path, fh):
+        log.debug("release %s", path)
         os.close(fh)
 
 
 def main(mountpoint, backend, password):
     os.makedirs(backend, exist_ok=True)
+    log.info("Mounting at %s", mountpoint)
     FUSE(FuseFS(backend, password), mountpoint, foreground=True)
+    log.info("Unmounted")
 
 
 if __name__ == "__main__":
