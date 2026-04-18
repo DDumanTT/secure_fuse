@@ -1,4 +1,5 @@
 import importlib
+import errno
 import os
 import sys
 
@@ -59,20 +60,25 @@ def test_salt_is_persisted_across_remounts(fuse_fs_module, tmp_path):
     assert fs1.master_key == fs2.master_key
 
 
-def test_full_path_strips_leading_slash(fs, tmp_path):
-    assert fs._full_path("/notes.txt") == os.path.join(str(tmp_path), "notes.txt")
-    assert fs._full_path("notes.txt") == os.path.join(str(tmp_path), "notes.txt")
+def test_root_node_is_persisted_across_remounts(fuse_fs_module, tmp_path):
+    backend = str(tmp_path / "fs")
+
+    fs1 = fuse_fs_module.FuseFS(backend, "password")
+    fs2 = fuse_fs_module.FuseFS(backend, "password")
+
+    assert fs1.root_id == fs2.root_id
+    assert (tmp_path / "fs" / ".root").read_text(encoding="utf-8") == fs1.root_id
 
 
 def test_load_or_create_fek_creates_and_reloads_same_key(fs, tmp_path):
-    path = "/doc.txt"
+    node_id = fs._generate_node_id()
 
-    first = fs._load_or_create_fek(path)
-    second = fs._load_or_create_fek(path)
+    first = fs._load_or_create_fek(node_id)
+    second = fs._load_or_create_fek(node_id)
 
     assert first == second
     assert len(first) == 32
-    assert os.path.exists(tmp_path / "doc.txt.key")
+    assert os.path.exists(tmp_path / "objects" / f"{node_id}.key")
 
 
 def test_create_write_and_read_round_trip(fs):
@@ -88,6 +94,16 @@ def test_create_write_and_read_round_trip(fs):
     assert out == b"world"
 
 
+def test_open_returns_a_file_handle_for_existing_file(fs):
+    path = "/open.bin"
+
+    fh = fs.create(path, 0o644)
+    fs.release(path, fh)
+
+    fh = fs.open(path, os.O_RDONLY)
+    fs.release(path, fh)
+
+
 def test_read_returns_empty_for_empty_file(fs):
     path = "/empty.txt"
 
@@ -97,18 +113,22 @@ def test_read_returns_empty_for_empty_file(fs):
     assert fs.read(path, size=10, offset=0, fh=None) == b""
 
 
-def test_readdir_hides_key_sidecar_and_salt_files(fs, tmp_path):
-    (tmp_path / "visible.txt").write_bytes(b"data")
-    (tmp_path / "visible.txt.key").write_bytes(b"secret")
-    (tmp_path / ".salt").write_bytes(b"salt")
+def test_readdir_returns_directory_entries_from_encrypted_manifest(fs):
+    fs.mkdir("/docs", 0o755)
+    fh = fs.create("/docs/visible.txt", 0o644)
+    fs.release("/docs/visible.txt", fh)
 
-    entries = set(fs.readdir("/", None))
+    root_entries = set(fs.readdir("/", None))
+    nested_entries = set(fs.readdir("/docs", None))
 
-    assert "." in entries
-    assert ".." in entries
-    assert "visible.txt" in entries
-    assert "visible.txt.key" not in entries
-    assert ".salt" not in entries
+    assert "." in root_entries
+    assert ".." in root_entries
+    assert "docs" in root_entries
+    assert "visible.txt" not in root_entries
+
+    assert "." in nested_entries
+    assert ".." in nested_entries
+    assert "visible.txt" in nested_entries
 
 
 def test_truncate_shortens_file(fs):
@@ -146,18 +166,153 @@ def test_truncate_pads_with_zeros_when_extending(fs):
     assert out == b"hi\x00\x00\x00"
 
 
-def test_unlink_removes_data_and_key_file(fs, tmp_path):
+def test_unlink_removes_all_opaque_node_files(fs, tmp_path):
     path = "/remove.me"
-    data_file = tmp_path / "remove.me"
-    key_file = tmp_path / "remove.me.key"
+    fh = fs.create(path, 0o644)
+    fs.release(path, fh)
 
-    data_file.write_bytes(b"content")
-    key_file.write_bytes(b"wrapped")
+    node_id, _ = fs._resolve_path(path)
+    blob_file = tmp_path / "objects" / f"{node_id}.blob"
+    meta_file = tmp_path / "objects" / f"{node_id}.meta"
+    key_file = tmp_path / "objects" / f"{node_id}.key"
+
+    assert blob_file.exists()
+    assert meta_file.exists()
+    assert key_file.exists()
 
     fs.unlink(path)
 
-    assert not data_file.exists()
+    assert not blob_file.exists()
+    assert not meta_file.exists()
     assert not key_file.exists()
+
+
+def test_write_pads_with_zeros_when_offset_exceeds_size(fs):
+    path = "/sparse.bin"
+
+    fh = fs.create(path, 0o644)
+    fs.release(path, fh)
+
+    fs.write(path, b"x", 3, None)
+
+    assert fs.read(path, size=10, offset=0, fh=None) == b"\x00\x00\x00x"
+
+
+def test_rename_moves_file_between_directories(fs):
+    fs.mkdir("/src", 0o755)
+    fs.mkdir("/dst", 0o755)
+    fh = fs.create("/src/file.txt", 0o644)
+    fs.release("/src/file.txt", fh)
+    fs.write("/src/file.txt", b"moved", 0, None)
+
+    fs.rename("/src/file.txt", "/dst/file.txt")
+
+    assert "file.txt" not in set(fs.readdir("/src", None))
+    assert "file.txt" in set(fs.readdir("/dst", None))
+    assert fs.read("/dst/file.txt", size=10, offset=0, fh=None) == b"moved"
+
+
+def test_rename_replaces_existing_file(fs):
+    fh = fs.create("/source.txt", 0o644)
+    fs.release("/source.txt", fh)
+    fs.write("/source.txt", b"new", 0, None)
+
+    fh = fs.create("/target.txt", 0o644)
+    fs.release("/target.txt", fh)
+    fs.write("/target.txt", b"old", 0, None)
+
+    fs.rename("/source.txt", "/target.txt")
+
+    assert fs.read("/target.txt", size=10, offset=0, fh=None) == b"new"
+    with pytest.raises(importlib.import_module("fuse_fs").FuseOSError) as exc_info:
+        fs.getattr("/source.txt")
+
+    assert exc_info.value.errno == errno.ENOENT
+
+
+def test_rename_rejects_replacing_non_empty_directory(fs, fuse_fs_module):
+    fs.mkdir("/src", 0o755)
+    fh = fs.create("/src/file.txt", 0o644)
+    fs.release("/src/file.txt", fh)
+    fs.mkdir("/dst", 0o755)
+    fh = fs.create("/dst/occupied.txt", 0o644)
+    fs.release("/dst/occupied.txt", fh)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fs.rename("/src", "/dst")
+
+    assert exc_info.value.errno == errno.ENOTEMPTY
+
+
+def test_rename_rejects_moving_directory_inside_itself(fs, fuse_fs_module):
+    fs.mkdir("/parent", 0o755)
+    fs.mkdir("/parent/child", 0o755)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fs.rename("/parent", "/parent/child/moved")
+
+    assert exc_info.value.errno == errno.EINVAL
+
+
+def test_utimens_updates_encrypted_metadata_timestamps(fs):
+    path = "/clock.txt"
+
+    fh = fs.create(path, 0o644)
+    fs.release(path, fh)
+
+    fs.utimens(path, (123.5, 456.5))
+
+    attrs = fs.getattr(path)
+    assert attrs["st_atime"] == 123.5
+    assert attrs["st_mtime"] == 456.5
+
+
+def test_backend_storage_does_not_leak_plaintext_names_or_structure(fs, tmp_path):
+    fs.mkdir("/projects", 0o755)
+    fs.mkdir("/projects/private", 0o755)
+    fh = fs.create("/projects/private/roadmap.txt", 0o644)
+    fs.release("/projects/private/roadmap.txt", fh)
+    fs.write("/projects/private/roadmap.txt", b"top secret", 0, None)
+
+    backend_names = []
+    for entry in tmp_path.rglob("*"):
+        relative = entry.relative_to(tmp_path)
+        backend_names.append(relative.as_posix())
+
+    joined = "\n".join(sorted(backend_names))
+    assert "projects" not in joined
+    assert "private" not in joined
+    assert "roadmap.txt" not in joined
+
+
+def test_rmdir_removes_empty_directory(fs):
+    fs.mkdir("/empty", 0o755)
+
+    fs.rmdir("/empty")
+
+    assert "empty" not in set(fs.readdir("/", None))
+
+
+def test_rmdir_rejects_non_empty_directory(fs, fuse_fs_module):
+    fs.mkdir("/docs", 0o755)
+    fh = fs.create("/docs/file.txt", 0o644)
+    fs.release("/docs/file.txt", fh)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fs.rmdir("/docs")
+
+    assert exc_info.value.errno == errno.ENOTEMPTY
+
+
+def test_nested_paths_round_trip(fs):
+    fs.mkdir("/alpha", 0o755)
+    fs.mkdir("/alpha/beta", 0o755)
+    fh = fs.create("/alpha/beta/data.bin", 0o644)
+    fs.release("/alpha/beta/data.bin", fh)
+
+    fs.write("/alpha/beta/data.bin", b"payload", 0, None)
+
+    assert fs.read("/alpha/beta/data.bin", size=7, offset=0, fh=None) == b"payload"
 
 
 def test_main_creates_backend_and_invokes_fuse(monkeypatch, tmp_path, fuse_fs_module):
