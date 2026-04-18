@@ -1,5 +1,6 @@
 import importlib
 import errno
+import json
 import os
 import sys
 
@@ -22,7 +23,7 @@ def fuse_fs_module(monkeypatch):
     monkeypatch.setattr(
         module.FuseFS,
         "_derive_master_key",
-        lambda self, password, salt: b"\x11" * 32,
+        lambda self, password, keyfile_material, salt, auth_metadata: b"\x11" * 32,
     )
 
     yield module
@@ -32,14 +33,19 @@ def fuse_fs_module(monkeypatch):
 
 @pytest.fixture
 def fs(tmp_path, fuse_fs_module):
-    return fuse_fs_module.FuseFS(str(tmp_path), "password")
+    backend = tmp_path / "backend"
+    keyfile_path = tmp_path / "auth.key"
+    keyfile_path.write_bytes(b"k" * 32)
+    return fuse_fs_module.FuseFS(str(backend), "password", str(keyfile_path))
 
 
 def test_derive_master_key_is_deterministic_for_same_password(fuse_fs_module, tmp_path):
     """Remounting the same backend with the same password yields the same master key."""
     backend = str(tmp_path / "fs")
-    fs1 = fuse_fs_module.FuseFS(backend, "password")
-    fs2 = fuse_fs_module.FuseFS(backend, "password")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+    fs1 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+    fs2 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
 
     assert fs1.master_key == fs2.master_key
     assert len(fs1.master_key) == 32
@@ -47,7 +53,9 @@ def test_derive_master_key_is_deterministic_for_same_password(fuse_fs_module, tm
 
 def test_salt_is_persisted_across_remounts(fuse_fs_module, tmp_path):
     backend = str(tmp_path / "fs")
-    fs1 = fuse_fs_module.FuseFS(backend, "password")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+    fs1 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
     salt_file = tmp_path / "fs" / ".salt"
 
     assert salt_file.exists()
@@ -55,16 +63,18 @@ def test_salt_is_persisted_across_remounts(fuse_fs_module, tmp_path):
     assert len(salt_bytes) == 16
 
     # Remounting must reuse the same salt file (not overwrite it).
-    fs2 = fuse_fs_module.FuseFS(backend, "password")
+    fs2 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
     assert salt_file.read_bytes() == salt_bytes
     assert fs1.master_key == fs2.master_key
 
 
 def test_root_node_is_persisted_across_remounts(fuse_fs_module, tmp_path):
     backend = str(tmp_path / "fs")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
 
-    fs1 = fuse_fs_module.FuseFS(backend, "password")
-    fs2 = fuse_fs_module.FuseFS(backend, "password")
+    fs1 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+    fs2 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
 
     assert fs1.root_id == fs2.root_id
     assert (tmp_path / "fs" / ".root").read_text(encoding="utf-8") == fs1.root_id
@@ -78,7 +88,7 @@ def test_load_or_create_fek_creates_and_reloads_same_key(fs, tmp_path):
 
     assert first == second
     assert len(first) == 32
-    assert os.path.exists(tmp_path / "objects" / f"{node_id}.key")
+    assert os.path.exists(fs.objects_dir + f"/{node_id}.key")
 
 
 def test_create_write_and_read_round_trip(fs):
@@ -172,19 +182,19 @@ def test_unlink_removes_all_opaque_node_files(fs, tmp_path):
     fs.release(path, fh)
 
     node_id, _ = fs._resolve_path(path)
-    blob_file = tmp_path / "objects" / f"{node_id}.blob"
-    meta_file = tmp_path / "objects" / f"{node_id}.meta"
-    key_file = tmp_path / "objects" / f"{node_id}.key"
+    blob_file = os.path.join(fs.objects_dir, f"{node_id}.blob")
+    meta_file = os.path.join(fs.objects_dir, f"{node_id}.meta")
+    key_file = os.path.join(fs.objects_dir, f"{node_id}.key")
 
-    assert blob_file.exists()
-    assert meta_file.exists()
-    assert key_file.exists()
+    assert os.path.exists(blob_file)
+    assert os.path.exists(meta_file)
+    assert os.path.exists(key_file)
 
     fs.unlink(path)
 
-    assert not blob_file.exists()
-    assert not meta_file.exists()
-    assert not key_file.exists()
+    assert not os.path.exists(blob_file)
+    assert not os.path.exists(meta_file)
+    assert not os.path.exists(key_file)
 
 
 def test_write_pads_with_zeros_when_offset_exceeds_size(fs):
@@ -327,8 +337,10 @@ def test_main_creates_backend_and_invokes_fuse(monkeypatch, tmp_path, fuse_fs_mo
 
     mountpoint = str(tmp_path / "mnt")
     backend = str(tmp_path / "backend")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
 
-    fuse_fs_module.main(mountpoint, backend, "pw")
+    fuse_fs_module.main(mountpoint, backend, "pw", str(keyfile))
 
     assert os.path.isdir(backend)
     assert calls["mountpoint"] == mountpoint
@@ -469,3 +481,49 @@ def test_rename_cross_parent_invokes_sync_for_both_parents(fs):
     assert src_node_id in synced_nodes
     assert dst_node_id in synced_nodes
     assert fs.objects_dir in synced_dirs
+
+
+def test_backend_auth_metadata_is_created_for_new_backend(fuse_fs_module, tmp_path):
+    backend = tmp_path / "fs"
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+
+    auth_payload = json.loads((backend / ".auth").read_text(encoding="utf-8"))
+    assert auth_payload["mode"] == "password_keyfile"
+    assert auth_payload["version"] == 1
+
+
+def test_existing_backend_without_auth_metadata_is_rejected(fuse_fs_module, tmp_path):
+    backend = tmp_path / "fs"
+    objects_dir = backend / "objects"
+    backend.mkdir()
+    objects_dir.mkdir()
+    (backend / ".salt").write_bytes(b"s" * 16)
+    (backend / ".root").write_text("deadbeef", encoding="utf-8")
+
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+
+    assert exc_info.value.errno == errno.EACCES
+
+
+def test_missing_keyfile_is_rejected(fuse_fs_module, tmp_path):
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fuse_fs_module.FuseFS(str(tmp_path / "fs"), "password", str(tmp_path / "missing.key"))
+
+    assert exc_info.value.errno == errno.EACCES
+
+
+def test_small_keyfile_is_rejected(fuse_fs_module, tmp_path):
+    keyfile = tmp_path / "small.key"
+    keyfile.write_bytes(b"tiny")
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc_info:
+        fuse_fs_module.FuseFS(str(tmp_path / "fs"), "password", str(keyfile))
+
+    assert exc_info.value.errno == errno.EACCES

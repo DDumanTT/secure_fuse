@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import argparse
+import getpass
 import logging
 import os
 
@@ -16,21 +18,22 @@ log = logging.getLogger("fuse_fs")
 logging.getLogger("fuse").setLevel(logging.WARNING)
 
 
-def main(mountpoint, backend, password):
+def main(mountpoint, backend, password, keyfile):
     os.makedirs(backend, exist_ok=True)
     log.info("Mounting at %s", mountpoint)
-    FUSE(FuseFS(backend, password), mountpoint, foreground=True)
+    FUSE(FuseFS(backend, password, keyfile), mountpoint, foreground=True)
     log.info("Unmounted")
 
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="Mount secure_fuse filesystem")
+    parser.add_argument("mountpoint")
+    parser.add_argument("backend")
+    parser.add_argument("--keyfile", required=True, help="Path to keyfile used for authentication")
+    args = parser.parse_args()
 
-    if len(sys.argv) != 4:
-        print("Usage: python prototype.py <mountpoint> <backend> <password>")
-        exit(1)
-
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    password = getpass.getpass("Password: ")
+    main(args.mountpoint, args.backend, password, args.keyfile)
 
 
 __all__ = ["FUSE", "FuseOSError", "Operations", "FuseFS", "main"]

@@ -1,4 +1,5 @@
 import errno
+import json
 import logging
 import os
 import secrets
@@ -8,7 +9,19 @@ import time
 from cryptography.exceptions import InvalidTag
 from fuse import FuseOSError
 
-from .constants import KEY_SIZE, SALT_SIZE, WIPE_CHUNK_SIZE, WIPE_PASSES
+from .constants import (
+    AUTH_FILE_NAME,
+    AUTH_MODE_PASSWORD_KEYFILE,
+    AUTH_VERSION,
+    KDF_ITERATIONS,
+    KDF_LANES,
+    KDF_MEMORY_COST,
+    KEY_SIZE,
+    MIN_KEYFILE_SIZE,
+    SALT_SIZE,
+    WIPE_CHUNK_SIZE,
+    WIPE_PASSES,
+)
 from .crypto import decrypt_bytes, decrypt_json, derive_master_key, encrypt_bytes, encrypt_json
 from .storage import blob_path, fsync_directory, fsync_path, key_path, meta_path, node_path, secure_wipe_blob
 
@@ -16,33 +29,107 @@ log = logging.getLogger("fuse_fs")
 
 
 class CoreOpsMixin:
-    def __init__(self, backend_path, password):
+    def __init__(self, backend_path, password, keyfile_path):
         self.backend = os.path.abspath(backend_path)
         self.objects_dir = os.path.join(self.backend, "objects")
         os.makedirs(self.backend, exist_ok=True)
         os.makedirs(self.objects_dir, exist_ok=True)
         log.info("Initialising filesystem (backend=%s)", self.backend)
-        salt = self._load_or_create_salt()
-        self.master_key = self._derive_master_key(password, salt)
-        self.root_id = self._load_or_create_root_id()
+        self.auth_metadata, auth_created = self._load_or_create_auth_metadata()
+        keyfile_material = self._load_keyfile_material(keyfile_path)
+        salt = self._load_or_create_salt(require_existing=not auth_created)
+        self.master_key = self._derive_master_key(password, keyfile_material, salt, self.auth_metadata)
+        self.root_id = self._load_or_create_root_id(require_existing=not auth_created)
         log.info("Filesystem ready (root_id=%s)", self.root_id)
 
     # Key management
 
-    def _load_or_create_salt(self) -> bytes:
+    def _auth_path(self):
+        return os.path.join(self.backend, AUTH_FILE_NAME)
+
+    def _is_pristine_backend(self):
+        backend_entries = [entry for entry in os.listdir(self.backend) if entry != "objects"]
+        if backend_entries:
+            return False
+        return len(os.listdir(self.objects_dir)) == 0
+
+    def _default_auth_metadata(self):
+        return {
+            "version": AUTH_VERSION,
+            "mode": AUTH_MODE_PASSWORD_KEYFILE,
+            "kdf": {
+                "iterations": KDF_ITERATIONS,
+                "memory_cost": KDF_MEMORY_COST,
+                "lanes": KDF_LANES,
+            },
+        }
+
+    def _validate_auth_metadata(self, payload):
+        if payload.get("version") != AUTH_VERSION:
+            raise FuseOSError(errno.EACCES)
+        if payload.get("mode") != AUTH_MODE_PASSWORD_KEYFILE:
+            raise FuseOSError(errno.EACCES)
+        kdf = payload.get("kdf")
+        if not isinstance(kdf, dict):
+            raise FuseOSError(errno.EACCES)
+        for key in ("iterations", "memory_cost", "lanes"):
+            if not isinstance(kdf.get(key), int):
+                raise FuseOSError(errno.EACCES)
+
+    def _load_or_create_auth_metadata(self):
+        auth_path = self._auth_path()
+
+        if os.path.exists(auth_path):
+            with open(auth_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self._validate_auth_metadata(payload)
+            return payload, False
+
+        if not self._is_pristine_backend():
+            # Legacy or unsupported backend state is intentionally not supported.
+            raise FuseOSError(errno.EACCES)
+
+        payload = self._default_auth_metadata()
+        with open(auth_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return payload, True
+
+    def _load_keyfile_material(self, keyfile_path):
+        if not keyfile_path:
+            raise FuseOSError(errno.EACCES)
+        try:
+            with open(keyfile_path, "rb") as f:
+                keyfile_material = f.read()
+        except OSError:
+            raise FuseOSError(errno.EACCES)
+
+        if len(keyfile_material) < MIN_KEYFILE_SIZE:
+            raise FuseOSError(errno.EACCES)
+
+        return keyfile_material
+
+    def _load_or_create_salt(self, *, require_existing=False) -> bytes:
         salt_path = os.path.join(self.backend, ".salt")
         if os.path.exists(salt_path):
             log.debug("Loading existing salt")
             with open(salt_path, "rb") as f:
                 return f.read()
+        if require_existing:
+            raise FuseOSError(errno.EACCES)
         log.info("Creating new salt")
         salt = secrets.token_bytes(SALT_SIZE)
         with open(salt_path, "wb") as f:
             f.write(salt)
         return salt
 
-    def _derive_master_key(self, password, salt):
-        return derive_master_key(password, salt, key_length=KEY_SIZE)
+    def _derive_master_key(self, password, keyfile_material, salt, auth_metadata):
+        return derive_master_key(
+            password,
+            keyfile_material,
+            salt,
+            key_length=KEY_SIZE,
+            kdf_params=auth_metadata["kdf"],
+        )
 
     def _root_path(self):
         return os.path.join(self.backend, ".root")
@@ -110,13 +197,15 @@ class CoreOpsMixin:
             "nlink": 2 if node_type == "dir" else 1,
         }
 
-    def _load_or_create_root_id(self):
+    def _load_or_create_root_id(self, *, require_existing=False):
         root_path = self._root_path()
         if os.path.exists(root_path):
             with open(root_path, "r", encoding="utf-8") as f:
                 root_id = f.read().strip()
             log.debug("Loaded existing root node %s", root_id)
         else:
+            if require_existing:
+                raise FuseOSError(errno.EACCES)
             root_id = self._generate_node_id()
             with open(root_path, "w", encoding="utf-8") as f:
                 f.write(root_id)

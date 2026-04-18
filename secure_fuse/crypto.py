@@ -4,22 +4,35 @@ import secrets
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
-from .constants import NONCE_SIZE
+from .constants import KDF_ITERATIONS, KDF_LANES, KDF_MEMORY_COST, NONCE_SIZE
 
 
-def derive_master_key(password, salt, key_length=32):
+def derive_master_key(password, keyfile_material, salt, key_length=32, *, kdf_params=None):
     if isinstance(password, str):
         password = password.encode("utf-8")
+
+    if not keyfile_material:
+        raise ValueError("Keyfile material is required")
+
+    params = {
+        "iterations": KDF_ITERATIONS,
+        "memory_cost": KDF_MEMORY_COST,
+        "lanes": KDF_LANES,
+    }
+    if kdf_params:
+        params.update(kdf_params)
+
+    combined_secret = password + keyfile_material
 
     kdf = Argon2id(
         salt=salt,
         length=key_length,
-        iterations=3,
-        memory_cost=2**16,  # 64 MB
-        lanes=4,
+        iterations=params["iterations"],
+        memory_cost=params["memory_cost"],
+        lanes=params["lanes"],
     )
 
-    return kdf.derive(password)
+    return kdf.derive(combined_secret)
 
 
 def encrypt_bytes(key, plaintext):
