@@ -24,6 +24,8 @@ KEY_SIZE = 32  # AES-256
 NONCE_SIZE = 12
 SALT_SIZE = 16
 GCM_TAG_SIZE = 16
+WIPE_PASSES = 1
+WIPE_CHUNK_SIZE = 64 * 1024
 
 
 class FuseFS(Operations):
@@ -290,8 +292,61 @@ class FuseFS(Operations):
 
         return False
 
+    def _secure_wipe_blob(self, node_id):
+        blob_path = self._blob_path(node_id)
+        try:
+            size = os.path.getsize(blob_path)
+        except FileNotFoundError:
+            return
+
+        if size <= 0:
+            return
+
+        try:
+            with open(blob_path, "r+b", buffering=0) as f:
+                for _ in range(WIPE_PASSES):
+                    f.seek(0)
+                    remaining = size
+                    while remaining > 0:
+                        chunk_size = min(remaining, WIPE_CHUNK_SIZE)
+                        f.write(secrets.token_bytes(chunk_size))
+                        remaining -= chunk_size
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                f.seek(0)
+                f.truncate(0)
+                f.flush()
+                os.fsync(f.fileno())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            # Wipe is best-effort; deletion continues with a warning.
+            log.warning("Best-effort blob wipe failed for node %s: %s", node_id, exc)
+
+    def _fsync_path(self, path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _fsync_directory(self, path):
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _sync_directory_node(self, node_id):
+        self._fsync_path(self._blob_path(node_id))
+        self._fsync_path(self._meta_path(node_id))
+
     def _remove_node(self, node_id):
-        for suffix in (".blob", ".meta", ".key"):
+        for suffix in (".key", ".blob", ".meta"):
             try:
                 os.unlink(self._node_path(node_id, suffix))
             except FileNotFoundError:
@@ -375,10 +430,13 @@ class FuseFS(Operations):
         if self._load_metadata(node_id)["type"] != "file":
             raise FuseOSError(errno.EISDIR)
 
+        self._secure_wipe_blob(node_id)
         self._remove_node(node_id)
         del entries[name]
         self._save_directory_entries(parent_id, entries)
         self._touch_metadata(parent_id, update_modify=True)
+        self._sync_directory_node(parent_id)
+        self._fsync_directory(self.objects_dir)
 
     def rmdir(self, path):
         log.info("rmdir %s", path)
@@ -398,6 +456,8 @@ class FuseFS(Operations):
         del entries[name]
         self._save_directory_entries(parent_id, entries)
         self._touch_metadata(parent_id, update_modify=True)
+        self._sync_directory_node(parent_id)
+        self._fsync_directory(self.objects_dir)
 
     def rename(self, old, new):
         log.info("rename %s -> %s", old, new)
@@ -424,6 +484,8 @@ class FuseFS(Operations):
                     raise FuseOSError(errno.ENOTDIR)
                 if replaced_metadata["type"] == "dir" and self._load_directory_entries(replaced_node_id):
                     raise FuseOSError(errno.ENOTEMPTY)
+                if replaced_metadata["type"] == "file":
+                    self._secure_wipe_blob(replaced_node_id)
 
                 self._remove_node(replaced_node_id)
                 del entries[new_name]
@@ -433,6 +495,8 @@ class FuseFS(Operations):
             self._save_directory_entries(old_parent_id, entries)
             self._touch_metadata(node_id, update_change=True)
             self._touch_metadata(old_parent_id, update_modify=True)
+            self._sync_directory_node(old_parent_id)
+            self._fsync_directory(self.objects_dir)
             return 0
 
         old_entries = self._load_directory_entries(old_parent_id)
@@ -456,6 +520,9 @@ class FuseFS(Operations):
                 self._touch_metadata(node_id, update_change=True)
                 self._touch_metadata(old_parent_id, update_modify=True)
                 self._touch_metadata(new_parent_id, update_modify=True)
+                self._sync_directory_node(old_parent_id)
+                self._sync_directory_node(new_parent_id)
+                self._fsync_directory(self.objects_dir)
                 return 0
 
             replaced_metadata = self._load_metadata(replaced_node_id)
@@ -465,6 +532,8 @@ class FuseFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             if replaced_metadata["type"] == "dir" and self._load_directory_entries(replaced_node_id):
                 raise FuseOSError(errno.ENOTEMPTY)
+            if replaced_metadata["type"] == "file":
+                self._secure_wipe_blob(replaced_node_id)
 
             self._remove_node(replaced_node_id)
             del new_entries[new_name]
@@ -476,6 +545,9 @@ class FuseFS(Operations):
         self._touch_metadata(node_id, update_change=True)
         self._touch_metadata(old_parent_id, update_modify=True)
         self._touch_metadata(new_parent_id, update_modify=True)
+        self._sync_directory_node(old_parent_id)
+        self._sync_directory_node(new_parent_id)
+        self._fsync_directory(self.objects_dir)
         return 0
 
     # File operations

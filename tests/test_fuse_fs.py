@@ -334,3 +334,138 @@ def test_main_creates_backend_and_invokes_fuse(monkeypatch, tmp_path, fuse_fs_mo
     assert calls["mountpoint"] == mountpoint
     assert calls["foreground"] is True
     assert isinstance(calls["obj"], fuse_fs_module.FuseFS)
+
+
+def test_unlink_wipes_blob_before_removing_node(fs):
+    path = "/ordered-delete.txt"
+    fh = fs.create(path, 0o644)
+    fs.release(path, fh)
+    fs.write(path, b"data", 0, None)
+    node_id, _ = fs._resolve_path(path)
+
+    order = []
+    original_remove_node = fs._remove_node
+
+    def record_wipe(target_node_id):
+        order.append(("wipe", target_node_id))
+
+    def record_remove(target_node_id):
+        order.append(("remove", target_node_id))
+        return original_remove_node(target_node_id)
+
+    fs._secure_wipe_blob = record_wipe
+    fs._remove_node = record_remove
+
+    fs.unlink(path)
+
+    assert order[:2] == [("wipe", node_id), ("remove", node_id)]
+
+
+def test_rename_same_parent_replacement_wipes_replaced_file(fs):
+    fh = fs.create("/source.txt", 0o644)
+    fs.release("/source.txt", fh)
+    fs.write("/source.txt", b"new", 0, None)
+
+    fh = fs.create("/target.txt", 0o644)
+    fs.release("/target.txt", fh)
+    fs.write("/target.txt", b"old", 0, None)
+
+    replaced_node_id, _ = fs._resolve_path("/target.txt")
+    wiped_nodes = []
+
+    def record_wipe(node_id):
+        wiped_nodes.append(node_id)
+
+    fs._secure_wipe_blob = record_wipe
+
+    fs.rename("/source.txt", "/target.txt")
+
+    assert replaced_node_id in wiped_nodes
+
+
+def test_rename_cross_parent_replacement_wipes_replaced_file(fs):
+    fs.mkdir("/src", 0o755)
+    fs.mkdir("/dst", 0o755)
+
+    fh = fs.create("/src/file.txt", 0o644)
+    fs.release("/src/file.txt", fh)
+    fs.write("/src/file.txt", b"new", 0, None)
+
+    fh = fs.create("/dst/file.txt", 0o644)
+    fs.release("/dst/file.txt", fh)
+    fs.write("/dst/file.txt", b"old", 0, None)
+
+    replaced_node_id, _ = fs._resolve_path("/dst/file.txt")
+    wiped_nodes = []
+
+    def record_wipe(node_id):
+        wiped_nodes.append(node_id)
+
+    fs._secure_wipe_blob = record_wipe
+
+    fs.rename("/src/file.txt", "/dst/file.txt")
+
+    assert replaced_node_id in wiped_nodes
+
+
+def test_rmdir_does_not_wipe_blob(fs):
+    fs.mkdir("/empty", 0o755)
+
+    def fail_if_called(_node_id):
+        raise AssertionError("_secure_wipe_blob should not be called by rmdir")
+
+    fs._secure_wipe_blob = fail_if_called
+
+    fs.rmdir("/empty")
+
+    assert "empty" not in set(fs.readdir("/", None))
+
+
+def test_unlink_invokes_directory_sync_hooks(fs):
+    fh = fs.create("/sync.txt", 0o644)
+    fs.release("/sync.txt", fh)
+
+    synced_nodes = []
+    synced_dirs = []
+
+    def record_sync_node(node_id):
+        synced_nodes.append(node_id)
+
+    def record_sync_dir(path):
+        synced_dirs.append(path)
+
+    fs._sync_directory_node = record_sync_node
+    fs._fsync_directory = record_sync_dir
+
+    fs.unlink("/sync.txt")
+
+    assert fs.root_id in synced_nodes
+    assert fs.objects_dir in synced_dirs
+
+
+def test_rename_cross_parent_invokes_sync_for_both_parents(fs):
+    fs.mkdir("/src", 0o755)
+    fs.mkdir("/dst", 0o755)
+    fh = fs.create("/src/file.txt", 0o644)
+    fs.release("/src/file.txt", fh)
+
+    src_node_id, _ = fs._resolve_path("/src")
+    dst_node_id, _ = fs._resolve_path("/dst")
+
+    synced_nodes = []
+    synced_dirs = []
+
+    def record_sync_node(node_id):
+        synced_nodes.append(node_id)
+
+    def record_sync_dir(path):
+        synced_dirs.append(path)
+
+    fs._sync_directory_node = record_sync_node
+    fs._fsync_directory = record_sync_dir
+
+    fs.rename("/src/file.txt", "/dst/file.txt")
+
+    assert src_node_id in synced_nodes
+    assert dst_node_id in synced_nodes
+    assert fs.objects_dir in synced_dirs
