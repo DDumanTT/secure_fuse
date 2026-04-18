@@ -1,33 +1,47 @@
 #!/usr/bin/env python3
 import os
+import stat
 import errno
 from fuse import FUSE, FuseOSError, Operations
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.exceptions import InvalidTag
 import secrets
-import json
 
-KEY_SIZE = 32 # AES-256
+KEY_SIZE = 32  # AES-256
 NONCE_SIZE = 12
+SALT_SIZE = 16
+GCM_TAG_SIZE = 16
 
 
 class FuseFS(Operations):
     def __init__(self, backend_path, password):
         self.backend = os.path.abspath(backend_path)
-        self.master_key = self._derive_master_key(password)
+        os.makedirs(self.backend, exist_ok=True)
+        salt = self._load_or_create_salt()
+        self.master_key = self._derive_master_key(password, salt)
 
     # Key management
 
-    def _derive_master_key(self, password: bytes) -> bytes:
+    def _load_or_create_salt(self) -> bytes:
+        salt_path = os.path.join(self.backend, ".salt")
+        if os.path.exists(salt_path):
+            with open(salt_path, "rb") as f:
+                return f.read()
+        salt = secrets.token_bytes(SALT_SIZE)
+        with open(salt_path, "wb") as f:
+            f.write(salt)
+        return salt
+
+    def _derive_master_key(self, password: bytes, salt: bytes) -> bytes:
         if isinstance(password, str):
             password = password.encode("utf-8")
 
         kdf = Argon2id(
-            salt=b'saltsalt', # TODO: generate salt
+            salt=salt,
             length=32,
             iterations=3,
-            memory_cost=2**16, # 64 MB
+            memory_cost=2**16,  # 64 MB
             lanes=4,
         )
 
@@ -74,9 +88,16 @@ class FuseFS(Operations):
         except FileNotFoundError:
             raise FuseOSError(errno.ENOENT)
 
+        raw_size = st.st_size
+        if stat.S_ISREG(st.st_mode) and raw_size > 0:
+            # On-disk layout: nonce (NONCE_SIZE) + ciphertext + GCM tag (GCM_TAG_SIZE)
+            plaintext_size = max(0, raw_size - NONCE_SIZE - GCM_TAG_SIZE)
+        else:
+            plaintext_size = raw_size
+
         return dict(
             st_mode=st.st_mode,
-            st_size=st.st_size,
+            st_size=plaintext_size,
             st_uid=st.st_uid,
             st_gid=st.st_gid,
             st_atime=st.st_atime,
@@ -91,7 +112,8 @@ class FuseFS(Operations):
 
         if os.path.isdir(full_path):
             entries.extend(
-                f for f in os.listdir(full_path) if not f.endswith(".key")
+                f for f in os.listdir(full_path)
+                if not f.endswith(".key") and f != ".salt"
             )
 
         for entry in entries:
@@ -156,6 +178,38 @@ class FuseFS(Operations):
 
             return len(data)
 
+        except Exception:
+            raise FuseOSError(errno.EIO)
+
+    def truncate(self, path, length, fh=None):
+        full_path = self._full_path(path)
+        fek = self._load_or_create_fek(path)
+
+        try:
+            plaintext = b""
+            if os.path.exists(full_path):
+                with open(full_path, "rb") as f:
+                    blob = f.read()
+                if blob:
+                    aes = AESGCM(fek)
+                    plaintext = aes.decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], None)
+
+            plaintext = plaintext[:length] + b"\x00" * max(0, length - len(plaintext))
+
+            if length == 0:
+                with open(full_path, "wb") as f:
+                    f.write(b"")
+                return
+
+            nonce = secrets.token_bytes(NONCE_SIZE)
+            aes = AESGCM(fek)
+            ciphertext = aes.encrypt(nonce, plaintext, None)
+
+            with open(full_path, "wb") as f:
+                f.write(nonce + ciphertext)
+
+        except InvalidTag:
+            raise FuseOSError(errno.EACCES)
         except Exception:
             raise FuseOSError(errno.EIO)
 
