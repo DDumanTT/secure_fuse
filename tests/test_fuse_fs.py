@@ -60,7 +60,7 @@ def test_salt_is_persisted_across_remounts(fuse_fs_module, tmp_path):
 
     assert salt_file.exists()
     salt_bytes = salt_file.read_bytes()
-    assert len(salt_bytes) == 16
+    assert len(salt_bytes) == 32
 
     # Remounting must reuse the same salt file (not overwrite it).
     fs2 = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
@@ -346,6 +346,197 @@ def test_main_creates_backend_and_invokes_fuse(monkeypatch, tmp_path, fuse_fs_mo
     assert calls["mountpoint"] == mountpoint
     assert calls["foreground"] is True
     assert isinstance(calls["obj"], fuse_fs_module.FuseFS)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: AES-GCM AAD binding — blob swaps between nodes must be rejected
+# ---------------------------------------------------------------------------
+
+def test_aad_binding_blob_swap_between_nodes_raises_eacces(fs, fuse_fs_module):
+    """Swapping .blob files between two file nodes must cause EACCES on read."""
+    fh1 = fs.create("/a.bin", 0o644)
+    fs.release("/a.bin", fh1)
+    fs.write("/a.bin", b"aaa", 0, None)
+
+    fh2 = fs.create("/b.bin", 0o644)
+    fs.release("/b.bin", fh2)
+    fs.write("/b.bin", b"bbb", 0, None)
+
+    node_a, _ = fs._resolve_path("/a.bin")
+    node_b, _ = fs._resolve_path("/b.bin")
+
+    # Swap the raw .blob files on disk
+    blob_a = os.path.join(fs.objects_dir, f"{node_a}.blob")
+    blob_b = os.path.join(fs.objects_dir, f"{node_b}.blob")
+    blob_a_data = open(blob_a, "rb").read()
+    blob_b_data = open(blob_b, "rb").read()
+    open(blob_a, "wb").write(blob_b_data)
+    open(blob_b, "wb").write(blob_a_data)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+        fs.read("/a.bin", 100, 0, None)
+    assert exc.value.errno == errno.EACCES
+
+
+def test_aad_binding_meta_swap_between_nodes_raises_eacces(fs, fuse_fs_module):
+    """Swapping .meta files between two nodes must cause EACCES on getattr."""
+    fh1 = fs.create("/x.bin", 0o644)
+    fs.release("/x.bin", fh1)
+    fh2 = fs.create("/y.bin", 0o644)
+    fs.release("/y.bin", fh2)
+
+    node_x, _ = fs._resolve_path("/x.bin")
+    node_y, _ = fs._resolve_path("/y.bin")
+
+    meta_x = os.path.join(fs.objects_dir, f"{node_x}.meta")
+    meta_y = os.path.join(fs.objects_dir, f"{node_y}.meta")
+    meta_x_data = open(meta_x, "rb").read()
+    meta_y_data = open(meta_y, "rb").read()
+    open(meta_x, "wb").write(meta_y_data)
+    open(meta_y, "wb").write(meta_x_data)
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+        fs.getattr("/x.bin")
+    assert exc.value.errno == errno.EACCES
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: backend control file MAC integrity
+# ---------------------------------------------------------------------------
+
+def test_tampered_auth_file_raises_eacces_on_remount(fuse_fs_module, tmp_path):
+    backend = str(tmp_path / "fs")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+    # Create a fresh filesystem (writes .auth and .auth.mac)
+    fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+
+    # Tamper with the .auth file
+    auth_file = tmp_path / "fs" / ".auth"
+    content = auth_file.read_text(encoding="utf-8")
+    tampered = content.replace('"version": 1', '"version": 2')
+    auth_file.write_text(tampered, encoding="utf-8")
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+        fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+    assert exc.value.errno == errno.EACCES
+
+
+def test_tampered_root_file_raises_eacces_on_remount(fuse_fs_module, tmp_path):
+    backend = str(tmp_path / "fs")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+    fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+
+    # Tamper with the .root file
+    root_file = tmp_path / "fs" / ".root"
+    root_file.write_text("000000000000000000000000000000000000", encoding="utf-8")
+
+    with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+        fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+    assert exc.value.errno == errno.EACCES
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: open() flag enforcement
+# ---------------------------------------------------------------------------
+
+def test_write_to_rdonly_handle_raises_ebadf(fs, fuse_fs_module):
+    fh = fs.create("/rdonly.txt", 0o644)
+    fs.release("/rdonly.txt", fh)
+
+    fh = fs.open("/rdonly.txt", os.O_RDONLY)
+    try:
+        with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+            fs.write("/rdonly.txt", b"data", 0, fh)
+        assert exc.value.errno == errno.EBADF
+    finally:
+        fs.release("/rdonly.txt", fh)
+
+
+def test_read_via_wronly_handle_raises_ebadf(fs, fuse_fs_module):
+    fh_create = fs.create("/wronly.txt", 0o644)
+    fs.release("/wronly.txt", fh_create)
+
+    fh = fs.open("/wronly.txt", os.O_WRONLY)
+    try:
+        with pytest.raises(fuse_fs_module.FuseOSError) as exc:
+            fs.read("/wronly.txt", 10, 0, fh)
+        assert exc.value.errno == errno.EBADF
+    finally:
+        fs.release("/wronly.txt", fh)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Merkle tree audit log
+# ---------------------------------------------------------------------------
+
+def test_audit_log_created_after_create_and_unlink(fs, tmp_path):
+    fh = fs.create("/audited.txt", 0o644)
+    fs.release("/audited.txt", fh)
+    fs.unlink("/audited.txt")
+
+    log_path = tmp_path / "backend" / "audit.log"
+    assert log_path.exists()
+    lines = [json.loads(l) for l in log_path.read_text().splitlines() if l]
+    ops = [e["op"] for e in lines]
+    assert "create" in ops
+    assert "unlink" in ops
+    for entry in lines:
+        assert "ts" in entry
+        assert "leaf_hash" in entry
+        assert "path" in entry
+
+
+def test_audit_verify_returns_true_on_untampered_log(fs, tmp_path):
+    fh = fs.create("/verify.txt", 0o644)
+    fs.release("/verify.txt", fh)
+    fs.write("/verify.txt", b"hello", 0, None)
+
+    assert fs.audit.verify() is True
+
+
+def test_audit_verify_returns_false_after_log_entry_mutation(fs, tmp_path):
+    fh = fs.create("/tamper.txt", 0o644)
+    fs.release("/tamper.txt", fh)
+
+    log_path = tmp_path / "backend" / "audit.log"
+    content = log_path.read_text()
+    # Corrupt the first character of the first line
+    corrupted = "X" + content[1:]
+    log_path.write_text(corrupted)
+
+    assert fs.audit.verify() is False
+
+
+def test_audit_verify_returns_false_after_entry_deletion(fs, tmp_path):
+    fh = fs.create("/del1.txt", 0o644)
+    fs.release("/del1.txt", fh)
+    fh = fs.create("/del2.txt", 0o644)
+    fs.release("/del2.txt", fh)
+
+    log_path = tmp_path / "backend" / "audit.log"
+    lines = log_path.read_text().splitlines()
+    # Remove the first entry
+    log_path.write_text("\n".join(lines[1:]) + "\n")
+
+    assert fs.audit.verify() is False
+
+
+def test_audit_root_tamper_raises_on_remount(fuse_fs_module, tmp_path):
+    backend = str(tmp_path / "fs")
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+    fs = fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+    fh = fs.create("/x.txt", 0o644)
+    fs.release("/x.txt", fh)
+
+    # Corrupt the Merkle root MAC
+    root_mac = tmp_path / "fs" / ".audit_root"
+    root_mac.write_bytes(b"\x00" * 32)
+
+    with pytest.raises(RuntimeError):
+        fuse_fs_module.FuseFS(backend, "password", str(keyfile))
 
 
 def test_unlink_wipes_blob_before_removing_node(fs):

@@ -2,15 +2,20 @@ import errno
 import logging
 import os
 import time
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from cryptography.exceptions import InvalidTag
 from fuse import FuseOSError
+
+if TYPE_CHECKING:
+    from .audit import AuditLogger
 
 log = logging.getLogger("fuse_fs")
 
 
 class _FileCoreProtocol(Protocol):
+    _open_fds: dict[int, int]
+    audit: "AuditLogger"
     def _resolve_path(self, path: str) -> tuple[str, dict[str, Any]]: ...
     def _blob_path(self, node_id: str) -> str: ...
     def _load_file_data(self, node_id: str) -> bytes: ...
@@ -33,10 +38,16 @@ class FileOpsMixin:
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
-        return os.open(self._blob_path(node_id), flags)
+        fh = os.open(self._blob_path(node_id), flags)
+        self._open_fds[fh] = flags
+        return fh
 
     def read(self: _FileCoreProtocol, path, size, offset, fh):
         log.debug("read %s (size=%d, offset=%d)", path, size, offset)
+        if fh is not None and fh in self._open_fds:
+            flags = self._open_fds[fh]
+            if (flags & os.O_ACCMODE) == os.O_WRONLY:
+                raise FuseOSError(errno.EBADF)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
@@ -48,6 +59,10 @@ class FileOpsMixin:
 
     def write(self: _FileCoreProtocol, path, data, offset, fh):
         log.debug("write %s (size=%d, offset=%d)", path, len(data), offset)
+        if fh is not None and fh in self._open_fds:
+            flags = self._open_fds[fh]
+            if (flags & os.O_ACCMODE) == os.O_RDONLY:
+                raise FuseOSError(errno.EBADF)
         node_id, metadata = self._resolve_path(path)
         if metadata["type"] != "file":
             raise FuseOSError(errno.EISDIR)
@@ -61,6 +76,7 @@ class FileOpsMixin:
 
             self._save_file_data(node_id, plaintext)
             self._touch_metadata(node_id, update_access=True, update_modify=True)
+            self.audit.log_event("write", path, node_id=node_id, size=len(data), offset=offset)
 
             return len(data)
 
@@ -84,6 +100,7 @@ class FileOpsMixin:
 
             self._save_file_data(node_id, plaintext)
             self._touch_metadata(node_id, update_modify=True)
+            self.audit.log_event("truncate", path, node_id=node_id, length=length)
 
         except InvalidTag:
             raise FuseOSError(errno.EACCES)
@@ -116,4 +133,5 @@ class FileOpsMixin:
 
     def release(self, path, fh):
         log.debug("release %s", path)
+        self._open_fds.pop(fh, None)
         os.close(fh)

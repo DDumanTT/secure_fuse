@@ -9,6 +9,7 @@ import time
 from cryptography.exceptions import InvalidTag
 from fuse import FuseOSError
 
+from .audit import AuditLogger
 from .constants import (
     AUTH_FILE_NAME,
     AUTH_MODE_PASSWORD_KEYFILE,
@@ -22,7 +23,7 @@ from .constants import (
     WIPE_CHUNK_SIZE,
     WIPE_PASSES,
 )
-from .crypto import decrypt_bytes, decrypt_json, derive_master_key, encrypt_bytes, encrypt_json
+from .crypto import compute_mac, decrypt_bytes, decrypt_json, derive_master_key, encrypt_bytes, encrypt_json, verify_mac
 from .storage import blob_path, fsync_directory, fsync_path, key_path, meta_path, node_path, secure_wipe_blob
 
 log = logging.getLogger("fuse_fs")
@@ -39,8 +40,40 @@ class CoreOpsMixin:
         keyfile_material = self._load_keyfile_material(keyfile_path)
         salt = self._load_or_create_salt(require_existing=not auth_created)
         self.master_key = self._derive_master_key(password, keyfile_material, salt, self.auth_metadata)
+        if not auth_created:
+            self._verify_file_mac(self._auth_path())
+        else:
+            self._write_file_mac(self._auth_path())
         self.root_id = self._load_or_create_root_id(require_existing=not auth_created)
+        self._open_fds: dict[int, int] = {}
+        self.audit = AuditLogger(self.backend, self.master_key)
         log.info("Filesystem ready (root_id=%s)", self.root_id)
+
+    # MAC helpers for backend control files
+
+    def _mac_path(self, file_path):
+        return file_path + ".mac"
+
+    def _write_file_mac(self, file_path):
+        with open(file_path, "rb") as f:
+            data = f.read()
+        mac = compute_mac(self.master_key, data)
+        with open(self._mac_path(file_path), "wb") as f:
+            f.write(mac)
+
+    def _verify_file_mac(self, file_path):
+        mac_path = self._mac_path(file_path)
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            with open(mac_path, "rb") as f:
+                stored_mac = f.read()
+        except FileNotFoundError:
+            log.warning("MAC file missing for %s — backend may have been tampered", file_path)
+            raise FuseOSError(errno.EACCES)
+        if not verify_mac(self.master_key, data, stored_mac):
+            log.error("MAC verification failed for %s — backend tampered", file_path)
+            raise FuseOSError(errno.EACCES)
 
     # Key management
 
@@ -149,34 +182,35 @@ class CoreOpsMixin:
     def _generate_node_id(self):
         return secrets.token_hex(16)
 
-    def _encrypt_bytes(self, key, plaintext):
-        return encrypt_bytes(key, plaintext)
+    def _encrypt_bytes(self, key, plaintext, aad: bytes | None = None):
+        return encrypt_bytes(key, plaintext, aad)
 
-    def _decrypt_bytes(self, key, blob):
-        return decrypt_bytes(key, blob)
+    def _decrypt_bytes(self, key, blob, aad: bytes | None = None):
+        return decrypt_bytes(key, blob, aad)
 
-    def _encrypt_json(self, key, payload):
-        return encrypt_json(key, payload)
+    def _encrypt_json(self, key, payload, aad: bytes | None = None):
+        return encrypt_json(key, payload, aad)
 
-    def _decrypt_json(self, key, blob):
-        return decrypt_json(key, blob)
+    def _decrypt_json(self, key, blob, aad: bytes | None = None):
+        return decrypt_json(key, blob, aad)
 
     def _load_or_create_fek(self, node_id):
         node_key_path = self._key_path(node_id)
+        aad = node_id.encode()
 
         if os.path.exists(node_key_path):
             log.debug("Loading FEK for node %s", node_id)
             with open(node_key_path, "rb") as f:
                 wrapped = f.read()
             try:
-                return self._decrypt_bytes(self.master_key, wrapped)
+                return self._decrypt_bytes(self.master_key, wrapped, aad)
             except InvalidTag:
                 log.warning("FEK decryption failed for node %s (bad master key?)", node_id)
                 raise FuseOSError(errno.EACCES)
 
         log.debug("Generating new FEK for node %s", node_id)
         fek = secrets.token_bytes(KEY_SIZE)
-        wrapped = self._encrypt_bytes(self.master_key, fek)
+        wrapped = self._encrypt_bytes(self.master_key, fek, aad)
 
         with open(node_key_path, "wb") as f:
             f.write(wrapped)
@@ -200,6 +234,7 @@ class CoreOpsMixin:
     def _load_or_create_root_id(self, *, require_existing=False):
         root_path = self._root_path()
         if os.path.exists(root_path):
+            self._verify_file_mac(root_path)
             with open(root_path, "r", encoding="utf-8") as f:
                 root_id = f.read().strip()
             log.debug("Loaded existing root node %s", root_id)
@@ -209,6 +244,7 @@ class CoreOpsMixin:
             root_id = self._generate_node_id()
             with open(root_path, "w", encoding="utf-8") as f:
                 f.write(root_id)
+            self._write_file_mac(root_path)
             log.info("Created new root node %s", root_id)
 
         if not os.path.exists(self._meta_path(root_id)):
@@ -228,9 +264,10 @@ class CoreOpsMixin:
 
     def _load_metadata(self, node_id):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         try:
             with open(self._meta_path(node_id), "rb") as f:
-                return self._decrypt_json(fek, f.read())
+                return self._decrypt_json(fek, f.read(), aad)
         except FileNotFoundError:
             raise FuseOSError(errno.ENOENT)
         except InvalidTag:
@@ -238,14 +275,16 @@ class CoreOpsMixin:
 
     def _save_metadata(self, node_id, metadata):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         with open(self._meta_path(node_id), "wb") as f:
-            f.write(self._encrypt_json(fek, metadata))
+            f.write(self._encrypt_json(fek, metadata, aad))
 
     def _load_directory_entries(self, node_id):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         try:
             with open(self._blob_path(node_id), "rb") as f:
-                payload = self._decrypt_json(fek, f.read())
+                payload = self._decrypt_json(fek, f.read(), aad)
         except FileNotFoundError:
             raise FuseOSError(errno.ENOENT)
         except InvalidTag:
@@ -254,11 +293,13 @@ class CoreOpsMixin:
 
     def _save_directory_entries(self, node_id, entries):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         with open(self._blob_path(node_id), "wb") as f:
-            f.write(self._encrypt_json(fek, {"entries": entries}))
+            f.write(self._encrypt_json(fek, {"entries": entries}, aad))
 
     def _load_file_data(self, node_id):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         node_blob_path = self._blob_path(node_id)
         try:
             with open(node_blob_path, "rb") as f:
@@ -270,15 +311,16 @@ class CoreOpsMixin:
             return b""
 
         try:
-            return self._decrypt_bytes(fek, blob)
+            return self._decrypt_bytes(fek, blob, aad)
         except InvalidTag:
             raise FuseOSError(errno.EACCES)
 
     def _save_file_data(self, node_id, plaintext):
         fek = self._load_or_create_fek(node_id)
+        aad = node_id.encode()
         with open(self._blob_path(node_id), "wb") as f:
             if plaintext:
-                f.write(self._encrypt_bytes(fek, plaintext))
+                f.write(self._encrypt_bytes(fek, plaintext, aad))
             else:
                 f.write(b"")
 

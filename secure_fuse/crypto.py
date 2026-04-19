@@ -1,5 +1,7 @@
+import hmac
 import json
 import secrets
+from hashlib import sha256
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
@@ -35,25 +37,34 @@ def derive_master_key(password, keyfile_material, salt, key_length=32, *, kdf_pa
     return kdf.derive(combined_secret)
 
 
-def encrypt_bytes(key, plaintext):
+def encrypt_bytes(key, plaintext, aad: bytes | None = None):
     nonce = secrets.token_bytes(NONCE_SIZE)
-    return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
+    return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
 
 
-def decrypt_bytes(key, blob):
+def decrypt_bytes(key, blob, aad: bytes | None = None):
     if not blob:
         return b""
     nonce = blob[:NONCE_SIZE]
     ciphertext = blob[NONCE_SIZE:]
-    return AESGCM(key).decrypt(nonce, ciphertext, None)
+    return AESGCM(key).decrypt(nonce, ciphertext, aad)
 
 
-def encrypt_json(key, payload):
-    return encrypt_bytes(key, json.dumps(payload).encode("utf-8"))
+def encrypt_json(key, payload, aad: bytes | None = None):
+    return encrypt_bytes(key, json.dumps(payload).encode("utf-8"), aad)
 
 
-def decrypt_json(key, blob):
-    plaintext = decrypt_bytes(key, blob)
+def decrypt_json(key, blob, aad: bytes | None = None):
+    plaintext = decrypt_bytes(key, blob, aad)
     if not plaintext:
         return {}
     return json.loads(plaintext.decode("utf-8"))
+
+
+def compute_mac(key: bytes, data: bytes) -> bytes:
+    return hmac.new(key, data, sha256).digest()
+
+
+def verify_mac(key: bytes, data: bytes, mac: bytes) -> bool:
+    expected = compute_mac(key, data)
+    return hmac.compare_digest(expected, mac)
