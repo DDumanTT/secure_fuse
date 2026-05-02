@@ -37,6 +37,16 @@ Verify a previously exported certificate:
 
 The verify command prints `valid` or `invalid` and exits with status 0 for valid and 1 for invalid.
 
+## Audit Log
+
+`audit.log` is encrypted at rest with AES-256-GCM using the master key derived from your password and keyfile. The file is not human-readable. To decrypt and view entries:
+
+```bash
+./fuse_fs.py audit-log <backend> --keyfile <path-to-keyfile>
+```
+
+Each entry is printed as a JSON object on its own line (NDJSON). Without the correct password and keyfile the log contents are opaque ciphertext.
+
 Use a keyfile with at least 32 bytes of random data.
 
 ```bash

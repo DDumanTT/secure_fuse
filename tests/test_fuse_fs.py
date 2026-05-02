@@ -478,13 +478,13 @@ def test_audit_log_created_after_create_and_unlink(fs, tmp_path):
 
     log_path = tmp_path / "backend" / "audit.log"
     assert log_path.exists()
-    lines = [json.loads(l) for l in log_path.read_text().splitlines() if l]
-    ops = [e["op"] for e in lines]
+    # Log is encrypted — read via the audit API
+    entries, _ = fs.audit._read_log_entries_and_leaves()
+    ops = [e["op"] for e in entries]
     assert "create" in ops
     assert "unlink" in ops
-    for entry in lines:
+    for entry in entries:
         assert "ts" in entry
-        assert "leaf_hash" in entry
         assert "path" in entry
 
 
@@ -501,10 +501,13 @@ def test_audit_verify_returns_false_after_log_entry_mutation(fs, tmp_path):
     fs.release("/tamper.txt", fh)
 
     log_path = tmp_path / "backend" / "audit.log"
-    content = log_path.read_text()
-    # Corrupt the first character of the first line
-    corrupted = "X" + content[1:]
-    log_path.write_text(corrupted)
+    # Each line is hex-encoded encrypted ciphertext; overwrite a byte in
+    # the middle of the first line to corrupt the GCM tag or ciphertext.
+    lines = log_path.read_text().splitlines()
+    mid = len(lines[0]) // 2
+    corrupted_line = lines[0][:mid] + ("0" if lines[0][mid] != "0" else "1") + lines[0][mid + 1:]
+    lines[0] = corrupted_line
+    log_path.write_text("\n".join(lines) + "\n")
 
     assert fs.audit.verify() is False
 
@@ -516,8 +519,8 @@ def test_audit_verify_returns_false_after_entry_deletion(fs, tmp_path):
     fs.release("/del2.txt", fh)
 
     log_path = tmp_path / "backend" / "audit.log"
+    # Each line is a hex-encoded encrypted entry; drop the first
     lines = log_path.read_text().splitlines()
-    # Remove the first entry
     log_path.write_text("\n".join(lines[1:]) + "\n")
 
     assert fs.audit.verify() is False
@@ -537,6 +540,43 @@ def test_audit_root_tamper_raises_on_remount(fuse_fs_module, tmp_path):
 
     with pytest.raises(RuntimeError):
         fuse_fs_module.FuseFS(backend, "password", str(keyfile))
+
+
+def test_cli_view_audit_log_decrypts_entries(fuse_fs_module, tmp_path, capsys):
+    backend = tmp_path / "fs"
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    fs = fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+    fh = fs.create("/logged.txt", 0o644)
+    fs.release("/logged.txt", fh)
+
+    entries = fuse_fs_module.view_audit_log(str(backend), "password", str(keyfile))
+
+    assert len(entries) >= 1
+    ops = [e["op"] for e in entries]
+    assert "create" in ops
+
+    out = capsys.readouterr().out
+    for line in out.strip().splitlines():
+        parsed = json.loads(line)
+        assert "op" in parsed
+        assert "path" in parsed
+
+
+def test_cli_view_audit_log_raw_file_is_not_plaintext(fuse_fs_module, tmp_path):
+    backend = tmp_path / "fs"
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    fs = fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+    fh = fs.create("/secret.txt", 0o644)
+    fs.release("/secret.txt", fh)
+
+    log_path = backend / "audit.log"
+    raw = log_path.read_text()
+    # Encrypted entries are hex strings; the path should not appear as plaintext
+    assert "/secret.txt" not in raw
 
 
 def test_audit_certificate_export_and_verify(fs):

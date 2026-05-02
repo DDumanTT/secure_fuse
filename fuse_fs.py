@@ -53,6 +53,15 @@ def verify_audit_certificate(backend, password, keyfile, certificate_path):
     return is_valid
 
 
+def view_audit_log(backend, password, keyfile):
+    """Decrypt and print all audit log entries, one JSON object per line."""
+    fs = FuseFS(backend, password, keyfile)
+    entries, _ = fs.audit._read_log_entries_and_leaves()
+    for entry in entries:
+        print(json.dumps(entry))
+    return entries
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(description="secure_fuse CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -77,13 +86,17 @@ def _build_parser():
     verify_parser.add_argument("certificate", help="Path to certificate JSON file")
     verify_parser.add_argument("--keyfile", required=True, help="Path to keyfile used for authentication")
 
+    log_parser = subparsers.add_parser("audit-log", help="Decrypt and print audit log entries")
+    log_parser.add_argument("backend")
+    log_parser.add_argument("--keyfile", required=True, help="Path to keyfile used for authentication")
+
     return parser
 
 
 def _is_legacy_mount_invocation(argv):
     if not argv:
         return False
-    known = {"mount", "audit-export", "audit-verify", "-h", "--help"}
+    known = {"mount", "audit-export", "audit-verify", "audit-log", "-h", "--help"}
     return argv[0] not in known
 
 
@@ -121,6 +134,9 @@ def _run_cli(argv=None):
         return 0
     if args.command == "audit-verify":
         return 0 if verify_audit_certificate(args.backend, password, args.keyfile, args.certificate) else 1
+    if args.command == "audit-log":
+        view_audit_log(args.backend, password, args.keyfile)
+        return 0
 
     parser.error("unknown command")
     return 2
@@ -138,5 +154,6 @@ __all__ = [
     "main",
     "export_audit_certificate",
     "verify_audit_certificate",
+    "view_audit_log",
     "_run_cli",
 ]

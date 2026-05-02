@@ -22,6 +22,8 @@ import os
 import struct
 from datetime import datetime, timezone
 
+from .crypto import decrypt_bytes, encrypt_bytes
+
 log = logging.getLogger("fuse_fs")
 
 _HASH_SIZE = 32  # SHA-256 output bytes
@@ -244,8 +246,9 @@ class AuditLogger:
         leaf_hash = _sha256(entry_bytes)
         entry["leaf_hash"] = leaf_hash.hex()
 
-        line = json.dumps(entry, separators=(",", ":"))
-        self._log_fh.write(line + "\n")
+        entry_json = json.dumps(entry, separators=(",", ":")).encode("utf-8")
+        encrypted = encrypt_bytes(self._key, entry_json)
+        self._log_fh.write(encrypted.hex() + "\n")
         self._log_fh.flush()
 
         self._tree.append_leaf(leaf_hash)
@@ -253,28 +256,18 @@ class AuditLogger:
         self._persist_root_mac()
 
     def verify(self) -> bool:
-        """Re-read every log line, rebuild the Merkle tree, compare root MAC.
+        """Decrypt every log entry, rebuild the Merkle tree, compare root MAC.
 
         Returns True if the log is intact, False if any tampering is detected.
         """
-        rebuilt = MerkleTree()
         try:
-            with open(self._log_path, "r", encoding="utf-8") as f:
-                for raw_line in f:
-                    raw_line = raw_line.rstrip("\n")
-                    if not raw_line:
-                        continue
-                    entry = json.loads(raw_line)
-                    stored_hex = entry.pop("leaf_hash", None)
-                    if stored_hex is None:
-                        return False
-                    entry_bytes = json.dumps(entry, separators=(",", ":")).encode("utf-8")
-                    computed = _sha256(entry_bytes)
-                    if computed.hex() != stored_hex:
-                        return False
-                    rebuilt.append_leaf(computed)
-        except (FileNotFoundError, json.JSONDecodeError):
+            _, leaves = self._read_log_entries_and_leaves()
+        except Exception:
             return False
+
+        rebuilt = MerkleTree()
+        for leaf in leaves:
+            rebuilt.append_leaf(leaf)
 
         expected_mac = _compute_root_mac(self._key, rebuilt.root())
         try:
@@ -397,7 +390,9 @@ class AuditLogger:
                 raw_line = raw_line.rstrip("\n")
                 if not raw_line:
                     continue
-                entry = json.loads(raw_line)
+                encrypted = bytes.fromhex(raw_line)
+                entry_json = decrypt_bytes(self._key, encrypted)
+                entry = json.loads(entry_json)
                 stored_hex = entry.pop("leaf_hash", None)
                 if stored_hex is None:
                     raise ValueError("missing leaf_hash")
