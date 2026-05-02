@@ -539,6 +539,60 @@ def test_audit_root_tamper_raises_on_remount(fuse_fs_module, tmp_path):
         fuse_fs_module.FuseFS(backend, "password", str(keyfile))
 
 
+def test_audit_certificate_export_and_verify(fs):
+    fh = fs.create("/cert1.txt", 0o644)
+    fs.release("/cert1.txt", fh)
+    fh = fs.create("/cert2.txt", 0o644)
+    fs.release("/cert2.txt", fh)
+
+    cert = fs.audit.export_certificate(leaf_index=1)
+
+    assert cert["leaf_index"] == 1
+    assert cert["tree_size"] >= 2
+    assert cert["proof"]
+    assert fs.audit.verify_certificate(cert) is True
+
+
+def test_audit_certificate_verify_fails_when_entry_tampered(fs):
+    fh = fs.create("/cert-entry.txt", 0o644)
+    fs.release("/cert-entry.txt", fh)
+
+    cert = fs.audit.export_certificate(leaf_index=0)
+    cert["entry"]["path"] = "/mutated.txt"
+
+    assert fs.audit.verify_certificate(cert) is False
+
+
+def test_audit_certificate_verify_fails_when_proof_tampered(fs):
+    fh = fs.create("/cert-proof-1.txt", 0o644)
+    fs.release("/cert-proof-1.txt", fh)
+    fh = fs.create("/cert-proof-2.txt", 0o644)
+    fs.release("/cert-proof-2.txt", fh)
+
+    cert = fs.audit.export_certificate(leaf_index=0)
+    cert["proof"][0]["hash"] = "00" * 32
+
+    assert fs.audit.verify_certificate(cert) is False
+
+
+def test_audit_certificate_verify_fails_when_root_mac_tampered(fs):
+    fh = fs.create("/cert-mac.txt", 0o644)
+    fs.release("/cert-mac.txt", fh)
+
+    cert = fs.audit.export_certificate(leaf_index=0)
+    cert["root_mac"] = "00" * 32
+
+    assert fs.audit.verify_certificate(cert) is False
+
+
+def test_audit_certificate_export_rejects_out_of_range_index(fs):
+    fh = fs.create("/cert-range.txt", 0o644)
+    fs.release("/cert-range.txt", fh)
+
+    with pytest.raises(IndexError):
+        fs.audit.export_certificate(leaf_index=999)
+
+
 def test_unlink_wipes_blob_before_removing_node(fs):
     path = "/ordered-delete.txt"
     fh = fs.create(path, 0o644)
@@ -718,3 +772,66 @@ def test_small_keyfile_is_rejected(fuse_fs_module, tmp_path):
         fuse_fs_module.FuseFS(str(tmp_path / "fs"), "password", str(keyfile))
 
     assert exc_info.value.errno == errno.EACCES
+
+
+def test_cli_export_and_verify_audit_certificate_round_trip(fuse_fs_module, tmp_path, capsys):
+    backend = tmp_path / "fs"
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    fs = fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+    fh = fs.create("/cert-cli.txt", 0o644)
+    fs.release("/cert-cli.txt", fh)
+
+    cert_path = tmp_path / "cert.json"
+    cert = fuse_fs_module.export_audit_certificate(
+        str(backend),
+        "password",
+        str(keyfile),
+        leaf_index=0,
+        output_path=str(cert_path),
+    )
+
+    assert cert_path.exists()
+    assert cert["leaf_index"] == 0
+
+    result = fuse_fs_module.verify_audit_certificate(
+        str(backend),
+        "password",
+        str(keyfile),
+        str(cert_path),
+    )
+
+    assert result is True
+    assert capsys.readouterr().out.strip().endswith("valid")
+
+
+def test_cli_verify_audit_certificate_prints_invalid_on_tamper(fuse_fs_module, tmp_path, capsys):
+    backend = tmp_path / "fs"
+    keyfile = tmp_path / "auth.key"
+    keyfile.write_bytes(b"k" * 32)
+
+    fs = fuse_fs_module.FuseFS(str(backend), "password", str(keyfile))
+    fh = fs.create("/cert-cli-tamper.txt", 0o644)
+    fs.release("/cert-cli-tamper.txt", fh)
+
+    cert_path = tmp_path / "cert-tamper.json"
+    cert = fuse_fs_module.export_audit_certificate(
+        str(backend),
+        "password",
+        str(keyfile),
+        leaf_index=0,
+        output_path=str(cert_path),
+    )
+    cert["root_mac"] = "00" * 32
+    cert_path.write_text(json.dumps(cert) + "\n", encoding="utf-8")
+
+    result = fuse_fs_module.verify_audit_certificate(
+        str(backend),
+        "password",
+        str(keyfile),
+        str(cert_path),
+    )
+
+    assert result is False
+    assert capsys.readouterr().out.strip().endswith("invalid")
