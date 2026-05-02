@@ -411,7 +411,9 @@ class CoreOpsMixin:
 
     def _remove_node(self, node_id):
         for suffix in (".key", ".blob", ".meta"):
+            path = self._node_path(node_id, suffix)
+            secure_wipe_blob(path, wipe_passes=WIPE_PASSES, wipe_chunk_size=WIPE_CHUNK_SIZE, logger=log)
             try:
-                os.unlink(self._node_path(node_id, suffix))
+                os.unlink(path)
             except FileNotFoundError:
                 pass
